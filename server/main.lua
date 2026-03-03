@@ -7,6 +7,10 @@ local DISCORD_FORUM_CHANNEL_ID = Config.discordForumChannelId or ""
 
 local playerThreads = {} -- In-memory cache: license -> Discord thread ID
 
+local function isPlaceholder(value, placeholder)
+    return type(value) ~= 'string' or value == '' or value == placeholder
+end
+
 -- ==========================================
 -- BASIC WEBHOOK LOGGING
 -- ==========================================
@@ -50,6 +54,32 @@ function sendDiscordMessage(title, description, color, extraFields)
         -- Silently handle response
     end, 'POST', json.encode({ embeds = embed }), { ['Content-Type'] = 'application/json' })
 end
+
+CreateThread(function()
+    Wait(1500)
+
+    local warnings = {}
+
+    if Config.enableWebhook and isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE') then
+        table.insert(warnings, 'Webhook logging enabled but Config.discordWebhookUrl is not configured.')
+    end
+
+    if Config.enableBotAPI and isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE') then
+        table.insert(warnings, 'Bot API enabled but Config.discordBotToken is not configured.')
+    end
+
+    if Config.enablePlayerThreads and isPlaceholder(DISCORD_FORUM_CHANNEL_ID, 'PASTE_YOUR_FORUM_CHANNEL_ID_HERE') then
+        table.insert(warnings, 'Player threads enabled but Config.discordForumChannelId is not configured.')
+    end
+
+    for _, warning in ipairs(warnings) do
+        print('^3[DG-Discord] WARNING: ' .. warning .. '^0')
+    end
+
+    if Config.enableWebhook and not isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE') then
+        logToDiscord('DG Discord Bot Online', 'Monitoring users', 5763719)
+    end
+end)
 
 -- ==========================================
 -- DISCORD BOT API & FORUM THREADS

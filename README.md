@@ -83,10 +83,16 @@ local banEmbed = exports['dg-discord-bot']:buildBanEmbed(
 )
 
 exports['dg-discord-bot']:sendDiscordMessage(nil, nil, nil, nil)
--- Or use the webhook directly
-PerformHttpRequest(Config.discordWebhookUrl, function() end, 'POST', 
-    json.encode({ embeds = { banEmbed } }), 
-    { ['Content-Type'] = 'application/json' }
+-- Send via dg-discord-bot export with fields
+exports['dg-discord-bot']:sendDiscordMessage(
+    'Ban Issued',
+    'A player was banned by the admin team.',
+    15158332,
+    {
+        { name = 'Player', value = 'John Doe', inline = true },
+        { name = 'Admin', value = 'Admin Smith', inline = true },
+        { name = 'Reason', value = 'Cheating', inline = false }
+    }
 )
 ```
 
@@ -251,8 +257,31 @@ ensure dg-discord-bot
 2. Create new application
 3. Go to "Bot" section
 4. Copy token to `config.lua`
-5. Enable required intents (Server Members, Message Content)
-6. Invite bot to your server
+5. Invite bot to your server
+
+### Bot Permissions (Recommended)
+Invite the bot with OAuth2 scope `bot` and grant these permissions in your server:
+
+- View Channels
+- Send Messages
+- Embed Links
+- Read Message History
+- Create Public Threads
+- Send Messages in Threads
+
+Optional (nice-to-have):
+- Manage Threads (if you want moderation actions on threads)
+
+### Intents
+This resource uses REST requests (webhook + HTTP Bot API) and does not require privileged gateway intents for current features.
+
+### Online Status: "Monitoring users"
+Discord custom presence text for a bot (for example, showing `Monitoring users`) requires a live Gateway/WebSocket bot session.
+This FiveM resource uses REST-only integration, so it cannot set global bot presence directly.
+
+Implemented fallback in this resource:
+- On startup, it posts a webhook message: `DG Discord Bot Online` with `Monitoring users`.
+- It also prints startup warnings if webhook/token/forum channel values are still placeholders.
 
 ### Forum Channel Setup
 1. Create a forum channel in Discord
