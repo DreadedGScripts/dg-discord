@@ -1,0 +1,59 @@
+DG-Scripts Commercial License (FiveM)
+
+Copyright (c) 2026 DG-Scripts. All rights reserved.
+
+IMPORTANT: This Software is licensed, not sold.
+By purchasing, downloading, installing, or using this Software, you agree to this license.
+
+1) License Grant
+- DG-Scripts grants the purchaser a limited, non-exclusive, non-transferable, revocable license
+	to use this Software.
+- License scope is one community/business owner account and one production server unless a
+	multi-server license is explicitly purchased from DG-Scripts.
+- A staging/development server owned by the same license holder is allowed.
+
+2) Permitted Use
+- You may run the Software on your licensed FiveM server(s) for personal or commercial operation.
+- You may edit/modify source files for your own server use.
+- You may create internal backups for disaster recovery.
+
+3) Prohibited Use
+- You may not resell, sublicense, lease, rent, share, gift, or redistribute the Software,
+	in whole or in part, in source or compiled form.
+- You may not publish, leak, or upload the Software to GitHub, GitLab, forums, Discord, cloud
+	drives, marketplaces, or any other public/private distribution channel.
+- You may not include this Software in "server packs," paid bundles, or template packages.
+- You may not transfer this license to another person/entity without written permission
+	from DG-Scripts.
+- You may not remove, alter, or hide copyright, branding, or license notices.
+
+4) Ownership and Intellectual Property
+- All rights, title, and interest in the Software remain with DG-Scripts.
+- This license grants use rights only and grants no ownership or trademark rights.
+
+5) Updates and Support
+- Updates and support are provided at DG-Scripts' discretion.
+- Proof of purchase/license ownership may be required before support is provided.
+
+6) Compliance
+- You are responsible for using this Software in compliance with applicable laws and with
+	platform/provider terms (including Cfx.re/FiveM policies).
+
+7) Termination
+- This license terminates automatically if you violate any term.
+- Upon termination, you must stop using the Software and delete all copies in your possession
+	or control.
+
+8) Warranty Disclaimer
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, AND NONINFRINGEMENT.
+
+9) Limitation of Liability
+IN NO EVENT SHALL DG-SCRIPTS OR ITS CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+10) Contact
+For licensing questions, transfer requests, or multi-server licensing, contact DG-Scripts.
+
