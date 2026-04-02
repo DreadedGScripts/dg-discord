@@ -6,6 +6,7 @@ local DISCORD_BOT_TOKEN = Config.discordBotToken or ""
 local DISCORD_FORUM_CHANNEL_ID = Config.discordForumChannelId or ""
 local WEBHOOK_THREAD_NAME = tostring(Config.webhookThreadName or '')
 local WEBHOOK_THREAD_NAMES = type(Config.webhookThreadNames) == 'table' and Config.webhookThreadNames or {}
+local CATEGORY_THREAD_STRATEGY = type(Config.categoryThreadStrategy) == 'table' and Config.categoryThreadStrategy or {}
 local ENABLE_CATEGORY_FORUMS = Config.enableCategoryForums ~= false
 local LEGACY_WEBHOOK_FALLBACK = Config.legacyWebhookFallback ~= false
 local FORUM_CATEGORIES = Config.forumCategories or {}
@@ -27,24 +28,68 @@ local function isPlaceholder(value, placeholder)
 end
 
 local function normalizeCategory(category)
-    return tostring(category or ''):lower():gsub('[^%w_]', '_')
+    local normalized = tostring(category or ''):lower():gsub('[^%w_]', '_')
+
+    -- Canonical category aliases to prevent accidental routing drift.
+    if normalized == 'detection' or normalized == 'detections' or normalized == 'score_detection' then
+        return 'scores_detections'
+    end
+
+    if normalized == 'admin_action' or normalized == 'actions' then
+        return 'admin_actions'
+    end
+
+    if normalized == 'session' or normalized == 'player_activity' then
+        return 'join_leave'
+    end
+
+    return normalized
 end
 
 local function getDefaultCategoryPostTitle(category)
     local normalized = normalizeCategory(category)
-    if normalized == 'join_leave' then
+    if normalized == 'general' or normalized == 'join_leave' then
         return 'Session | Player Activity'
     elseif normalized == 'scores_detections' then
-        return 'Detections | Score Update'
+        return 'Detection Alerts | Score Update'
     elseif normalized == 'reports' then
         return 'Reports | Update'
-    elseif normalized == 'moderation' then
+    elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
         return 'Moderation | Action'
-    elseif normalized == 'admin_audit' then
-        return 'Audit | Admin Event'
     end
 
     return 'DG Log | ' .. tostring(category or 'general')
+end
+
+local function getCategoryLabel(category)
+    local normalized = normalizeCategory(category)
+    if normalized == 'general' or normalized == 'join_leave' then
+        return 'Player Join/Leave'
+    elseif normalized == 'scores_detections' then
+        return 'Detection Alerts'
+    elseif normalized == 'reports' then
+        return 'Reports'
+    elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
+        return 'Admin Actions'
+    end
+
+    return tostring(category or 'General')
+end
+
+local function resolveThreadStrategy(category, payload)
+    payload = type(payload) == 'table' and payload or {}
+    local normalized = normalizeCategory(category)
+
+    if type(payload.threadStrategy) == 'string' and payload.threadStrategy ~= '' then
+        return tostring(payload.threadStrategy):lower()
+    end
+
+    local configured = CATEGORY_THREAD_STRATEGY[normalized]
+    if type(configured) == 'string' and configured ~= '' then
+        return tostring(configured):lower()
+    end
+
+    return 'daily'
 end
 
 local function getCategoryForumChannelId(category)
@@ -54,8 +99,17 @@ local function getCategoryForumChannelId(category)
         return tostring(configured)
     end
 
+    local generalConfigured = FORUM_CATEGORIES.general
+    if generalConfigured and generalConfigured ~= '' and not tostring(generalConfigured):find('PASTE_') then
+        return tostring(generalConfigured)
+    end
+
     -- Keep compatibility with the old single-forum setup.
     if normalized == 'scores_detections' then
+        return DISCORD_FORUM_CHANNEL_ID
+    end
+
+    if DISCORD_FORUM_CHANNEL_ID and DISCORD_FORUM_CHANNEL_ID ~= '' and DISCORD_FORUM_CHANNEL_ID ~= 'PASTE_YOUR_FORUM_CHANNEL_ID_HERE' then
         return DISCORD_FORUM_CHANNEL_ID
     end
 
@@ -78,22 +132,20 @@ local function buildWebhookThreadName(category, payload)
     end
 
     if type(configured) == 'string' and configured ~= '' then
-        if normalized == 'join_leave' then
+        if normalized == 'general' or normalized == 'join_leave' then
             return safeSub(configured .. '-' .. os.date('%Y-%m-%d'), 90)
         end
         return safeSub(configured, 90)
     end
 
-    if normalized == 'join_leave' then
-        return safeSub('player-joins-leaves-' .. os.date('%Y-%m-%d'), 90)
+    if normalized == 'general' or normalized == 'join_leave' then
+        return safeSub('player-join-leave-' .. os.date('%Y-%m-%d'), 90)
     elseif normalized == 'scores_detections' then
-        return 'cheat-scores-detections'
+        return 'detection-alerts'
     elseif normalized == 'reports' then
         return 'admin-reports'
-    elseif normalized == 'moderation' then
-        return 'admin-moderation-actions'
-    elseif normalized == 'admin_audit' then
-        return 'admin-audit-trail'
+    elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
+        return 'admin-actions'
     end
 
     if WEBHOOK_THREAD_NAME ~= '' then
@@ -146,17 +198,39 @@ end
 local function getCategoryThreadKey(category, payload)
     local normalized = normalizeCategory(category)
     payload = type(payload) == 'table' and payload or {}
+    local strategy = resolveThreadStrategy(normalized, payload)
 
-    if normalized == 'join_leave' then
+    if strategy == 'single' then
+        -- Versioned single-thread keys ensure legacy/stale DB mappings do not
+        -- collapse detections/admin logs into join/leave threads.
+        if normalized == 'scores_detections' then
+            return 'scores_detections_v2'
+        elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
+            return 'admin_actions_v2'
+        elseif normalized == 'general' or normalized == 'join_leave' then
+            return 'join_leave_v1'
+        end
+        return normalized
+    elseif strategy == 'daily' then
+        return os.date('%Y-%m-%d')
+    elseif strategy == 'per_player' then
+        return tostring(payload.playerLicense or payload.license or payload.playerName or payload.targetLicense or payload.targetId or payload.targetName or 'unknown')
+    elseif strategy == 'per_report' then
+        return tostring(payload.reportId or ('reporter_' .. tostring(payload.reporterId or 'unknown')))
+    elseif strategy == 'per_admin_day' then
+        return tostring(payload.adminLicense or payload.adminId or payload.adminName or 'admin') .. ':' .. os.date('%Y-%m-%d')
+    elseif strategy == 'custom' and payload.threadKey then
+        return tostring(payload.threadKey)
+    end
+
+    if normalized == 'general' or normalized == 'join_leave' then
         return os.date('%Y-%m-%d')
     elseif normalized == 'scores_detections' then
         return tostring(payload.playerLicense or payload.license or payload.playerName or 'unknown')
     elseif normalized == 'reports' then
         return tostring(payload.reportId or ('reporter_' .. tostring(payload.reporterId or 'unknown')))
-    elseif normalized == 'moderation' then
-        return tostring(payload.targetLicense or payload.targetId or payload.targetName or 'unknown')
-    elseif normalized == 'admin_audit' then
-        return tostring(payload.adminLicense or payload.adminId or payload.adminName or 'unknown') .. ':' .. os.date('%Y-%m-%d')
+    elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
+        return 'admin-actions'
     end
 
     return tostring(payload.threadKey or payload.playerLicense or payload.license or os.date('%Y-%m-%d'))
@@ -165,21 +239,42 @@ end
 local function buildCategoryThreadName(category, payload)
     local normalized = normalizeCategory(category)
     payload = type(payload) == 'table' and payload or {}
+    local strategy = resolveThreadStrategy(normalized, payload)
+    local categoryLabel = getCategoryLabel(normalized)
+    local configuredSlug = WEBHOOK_THREAD_NAMES[normalized]
 
-    if normalized == 'join_leave' then
+    if strategy == 'single' then
+        if type(configuredSlug) == 'string' and configuredSlug ~= '' then
+            return safeSub(configuredSlug, 100)
+        end
+        return safeSub(string.lower(categoryLabel:gsub('[^%w]+', '-')), 100)
+    elseif strategy == 'daily' then
+        if type(configuredSlug) == 'string' and configuredSlug ~= '' then
+            return safeSub(configuredSlug .. '-' .. os.date('%Y-%m-%d'), 100)
+        end
+        return safeSub(string.lower(categoryLabel:gsub('[^%w]+', '-')) .. '-' .. os.date('%Y-%m-%d'), 100)
+    elseif strategy == 'per_player' then
+        local playerName = payload.playerName or payload.targetName or 'Unknown Player'
+        return safeSub('🧵 ' .. categoryLabel .. ' - ' .. tostring(playerName), 100)
+    elseif strategy == 'per_report' then
+        local reportId = payload.reportId and ('#' .. tostring(payload.reportId)) or '#new'
+        return safeSub('🧵 ' .. categoryLabel .. ' ' .. reportId, 100)
+    elseif strategy == 'per_admin_day' then
+        local adminName = payload.adminName or 'Unknown Admin'
+        return safeSub('🧵 ' .. categoryLabel .. ' - ' .. tostring(adminName) .. ' - ' .. os.date('%Y-%m-%d'), 100)
+    elseif strategy == 'custom' and payload.threadName then
+        return safeSub(tostring(payload.threadName), 100)
+    end
+
+    if normalized == 'general' or normalized == 'join_leave' then
         return safeSub('🟢 Join/Leave - ' .. os.date('%Y-%m-%d'), 100)
     elseif normalized == 'scores_detections' then
-        local playerName = payload.playerName or 'Unknown Player'
-        return safeSub('📈 Scores - ' .. tostring(playerName), 100)
+        return safeSub('🚨 Detection Alerts', 100)
     elseif normalized == 'reports' then
         local reportId = payload.reportId and ('#' .. tostring(payload.reportId)) or '#new'
         return safeSub('📣 Reports ' .. reportId, 100)
-    elseif normalized == 'moderation' then
-        local targetName = payload.targetName or 'Unknown Player'
-        return safeSub('🔨 Moderation - ' .. tostring(targetName), 100)
-    elseif normalized == 'admin_audit' then
-        local adminName = payload.adminName or 'Unknown Admin'
-        return safeSub('🛡️ Audit - ' .. tostring(adminName) .. ' - ' .. os.date('%Y-%m-%d'), 100)
+    elseif normalized == 'moderation' or normalized == 'admin_audit' or normalized == 'admin_actions' then
+        return safeSub('🛡️ Admin Actions', 100)
     end
 
     return safeSub('📌 ' .. tostring(category or 'general') .. ' - ' .. os.date('%Y-%m-%d'), 100)
@@ -206,6 +301,7 @@ local function createForumThread(forumChannelId, threadName, starterContent, cal
             end
 
             logDiscordHttpFailure('Thread creation (forum ' .. tostring(forumChannelId) .. ')', statusCode, response)
+            print('^3[DG-Discord] Verify forum channel ID is the parent FORUM channel ID (not an existing thread ID) and bot has Create Public Threads + Send Messages in Threads.^0')
             if callback then callback(nil) end
         end,
         'POST', body,
@@ -218,11 +314,13 @@ end
 
 local function getOrCreateCategoryThread(category, payload, callback)
     if not Config.enableBotAPI or not ENABLE_CATEGORY_FORUMS then
+        print('^3[DG-Discord] Category thread skipped: bot API or category forums are disabled.^0')
         if callback then callback(nil) end
         return
     end
 
     if isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE') then
+        print('^1[DG-Discord] Category thread skipped: Config.discordBotToken is not configured.^0')
         if callback then callback(nil) end
         return
     end
@@ -230,6 +328,7 @@ local function getOrCreateCategoryThread(category, payload, callback)
     local normalized = normalizeCategory(category)
     local forumChannelId = getCategoryForumChannelId(normalized)
     if not forumChannelId then
+        print('^1[DG-Discord] Category thread skipped: no forum channel mapped for category ' .. tostring(normalized) .. '.^0')
         if callback then callback(nil) end
         return
     end
@@ -256,6 +355,32 @@ local function getOrCreateCategoryThread(category, payload, callback)
                 buildCategoryThreadName(normalized, payload),
                 '🧵 Category log thread for **' .. normalized .. '**.',
                 function(createdThreadId)
+                    if not createdThreadId
+                        and DISCORD_FORUM_CHANNEL_ID
+                        and DISCORD_FORUM_CHANNEL_ID ~= ''
+                        and DISCORD_FORUM_CHANNEL_ID ~= 'PASTE_YOUR_FORUM_CHANNEL_ID_HERE'
+                        and tostring(forumChannelId) ~= tostring(DISCORD_FORUM_CHANNEL_ID) then
+                        print('^3[DG-Discord] Retrying category thread on default forum channel ' .. tostring(DISCORD_FORUM_CHANNEL_ID) .. ' for category ' .. tostring(normalized) .. '.^0')
+
+                        createForumThread(
+                            DISCORD_FORUM_CHANNEL_ID,
+                            buildCategoryThreadName(normalized, payload),
+                            '🧵 Category log thread for **' .. normalized .. '**.',
+                            function(retryThreadId)
+                                if retryThreadId then
+                                    categoryThreads[cacheKey] = tostring(retryThreadId)
+                                    MySQL.Async.execute(
+                                        'INSERT IGNORE INTO dg_discord_category_threads (category_key, thread_key, thread_id, thread_name) VALUES (?, ?, ?, ?)',
+                                        { normalized, threadKey, retryThreadId, buildCategoryThreadName(normalized, payload) }
+                                    )
+                                end
+
+                                if callback then callback(retryThreadId, cacheKey) end
+                            end
+                        )
+                        return
+                    end
+
                     if createdThreadId then
                         categoryThreads[cacheKey] = tostring(createdThreadId)
                         MySQL.Async.execute(
@@ -345,9 +470,25 @@ end
 -- BASIC WEBHOOK LOGGING
 -- ==========================================
 
+local function canUseBotLogging()
+    return Config.enableBotAPI
+        and not isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE')
+        and (DISCORD_FORUM_CHANNEL_ID and DISCORD_FORUM_CHANNEL_ID ~= '' and DISCORD_FORUM_CHANNEL_ID ~= 'PASTE_YOUR_FORUM_CHANNEL_ID_HERE')
+end
+
 -- Export: Simple Discord webhook logging
 function logToDiscord(title, message, color)
-    if not Config.enableWebhook then return end
+    if not Config.enableWebhook then
+        if canUseBotLogging() then
+            postToCategoryForum('admin_audit', {
+                title = tostring(title or 'DG Log'),
+                description = tostring(message or 'No message provided.'),
+                color = color or 3447003
+            })
+        end
+        return
+    end
+
     local webhook = DISCORD_WEBHOOK
     if webhook == '' or webhook == 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE' then return end
     
@@ -374,7 +515,18 @@ end
 
 -- Export: Send Discord message with custom fields
 function sendDiscordMessage(title, description, color, extraFields)
-    if not Config.enableWebhook then return end
+    if not Config.enableWebhook then
+        if canUseBotLogging() then
+            postToCategoryForum('admin_audit', {
+                title = tostring(title or 'DG Log'),
+                description = tostring(description or 'No message provided.'),
+                color = color or 3447003,
+                fields = type(extraFields) == 'table' and extraFields or {}
+            })
+        end
+        return
+    end
+
     if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" or DISCORD_WEBHOOK == 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE' then return end
     
     local fields = extraFields or {}
@@ -423,7 +575,7 @@ CreateThread(function()
         print('^3[DG-Discord] WARNING: ' .. warning .. '^0')
     end
 
-    if Config.enableWebhook and not isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE') then
+    if (Config.enableWebhook and not isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE')) or canUseBotLogging() then
         logToDiscord('DG Discord Bot Online', 'Monitoring users', 5763719)
     end
 end)
@@ -545,6 +697,16 @@ end
 
 -- Export: Post a category log into category-specific forum threads with webhook fallback.
 function postToCategoryForum(category, payload)
+    -- Backward/defensive compatibility: some callers may pass only a payload table.
+    if type(category) == 'table' and payload == nil then
+        payload = category
+        category = payload.category or payload.logCategory or payload.channel or payload.type or 'general'
+    end
+
+    if type(category) ~= 'string' or category == '' then
+        category = 'general'
+    end
+
     payload = type(payload) == 'table' and payload or {}
     local embeds = payload.embeds
     if not embeds then
@@ -570,6 +732,7 @@ function postToCategoryForum(category, payload)
 
     getOrCreateCategoryThread(category, payload, function(threadId, cacheKey)
         if not threadId then
+            print('^1[DG-Discord] Bot thread unavailable for category ' .. tostring(category) .. '.^0')
             fallbackToWebhook(category, payload)
             return
         end
