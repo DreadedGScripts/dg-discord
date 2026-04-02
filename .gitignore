@@ -1,0 +1,15 @@
+# Local configuration with secrets - never commit
+config.lua
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Node
+node_modules/
