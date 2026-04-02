@@ -4,12 +4,23 @@
 local DISCORD_WEBHOOK = Config.discordWebhookUrl or ""
 local DISCORD_BOT_TOKEN = Config.discordBotToken or ""
 local DISCORD_FORUM_CHANNEL_ID = Config.discordForumChannelId or ""
+local WEBHOOK_THREAD_NAME = tostring(Config.webhookThreadName or '')
+local WEBHOOK_THREAD_NAMES = type(Config.webhookThreadNames) == 'table' and Config.webhookThreadNames or {}
 local ENABLE_CATEGORY_FORUMS = Config.enableCategoryForums ~= false
 local LEGACY_WEBHOOK_FALLBACK = Config.legacyWebhookFallback ~= false
 local FORUM_CATEGORIES = Config.forumCategories or {}
+local CATEGORY_LOG_TRANSPORT = tostring(Config.categoryLogTransport or 'webhook'):lower()
 
 local playerThreads = {} -- In-memory cache: license -> Discord thread ID
 local categoryThreads = {} -- In-memory cache: "category:threadKey" -> Discord thread ID
+
+local function logDiscordHttpFailure(scope, statusCode, response)
+    local snippet = tostring(response or '')
+    if #snippet > 240 then
+        snippet = snippet:sub(1, 240) .. '...'
+    end
+    print('^1[DG-Discord] ' .. tostring(scope) .. ' failed (HTTP ' .. tostring(statusCode) .. ') | ' .. snippet .. '^0')
+end
 
 local function isPlaceholder(value, placeholder)
     return type(value) ~= 'string' or value == '' or value == placeholder
@@ -17,6 +28,23 @@ end
 
 local function normalizeCategory(category)
     return tostring(category or ''):lower():gsub('[^%w_]', '_')
+end
+
+local function getDefaultCategoryPostTitle(category)
+    local normalized = normalizeCategory(category)
+    if normalized == 'join_leave' then
+        return 'Session | Player Activity'
+    elseif normalized == 'scores_detections' then
+        return 'Detections | Score Update'
+    elseif normalized == 'reports' then
+        return 'Reports | Update'
+    elseif normalized == 'moderation' then
+        return 'Moderation | Action'
+    elseif normalized == 'admin_audit' then
+        return 'Audit | Admin Event'
+    end
+
+    return 'DG Log | ' .. tostring(category or 'general')
 end
 
 local function getCategoryForumChannelId(category)
@@ -38,6 +66,81 @@ local function safeSub(str, maxLen)
     local value = tostring(str or '')
     if #value <= maxLen then return value end
     return value:sub(1, math.max(1, maxLen - 1))
+end
+
+local function buildWebhookThreadName(category, payload)
+    payload = type(payload) == 'table' and payload or {}
+    local normalized = normalizeCategory(category)
+    local configured = WEBHOOK_THREAD_NAMES[normalized]
+
+    if type(payload.webhookThreadName) == 'string' and payload.webhookThreadName ~= '' then
+        return safeSub(payload.webhookThreadName, 90)
+    end
+
+    if type(configured) == 'string' and configured ~= '' then
+        if normalized == 'join_leave' then
+            return safeSub(configured .. '-' .. os.date('%Y-%m-%d'), 90)
+        end
+        return safeSub(configured, 90)
+    end
+
+    if normalized == 'join_leave' then
+        return safeSub('player-joins-leaves-' .. os.date('%Y-%m-%d'), 90)
+    elseif normalized == 'scores_detections' then
+        return 'cheat-scores-detections'
+    elseif normalized == 'reports' then
+        return 'admin-reports'
+    elseif normalized == 'moderation' then
+        return 'admin-moderation-actions'
+    elseif normalized == 'admin_audit' then
+        return 'admin-audit-trail'
+    end
+
+    if WEBHOOK_THREAD_NAME ~= '' then
+        return safeSub(WEBHOOK_THREAD_NAME, 90)
+    end
+
+    return nil
+end
+
+local function sendWebhookPayload(payload, scopeLabel)
+    if not Config.enableWebhook then return false end
+    if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == '' or DISCORD_WEBHOOK == 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE' then
+        return false
+    end
+
+    PerformHttpRequest(DISCORD_WEBHOOK, function(statusCode, response)
+        if statusCode ~= 200 and statusCode ~= 201 and statusCode ~= 204 then
+            logDiscordHttpFailure(scopeLabel or 'Webhook request', statusCode, response)
+        end
+    end, 'POST', json.encode(payload), { ['Content-Type'] = 'application/json' })
+
+    return true
+end
+
+local function canUseBotCategoryTransport(category)
+    if not Config.enableBotAPI or not ENABLE_CATEGORY_FORUMS then
+        return false
+    end
+
+    if isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE') then
+        return false
+    end
+
+    return getCategoryForumChannelId(category) ~= nil
+end
+
+local function shouldUseWebhookTransportFirst(category)
+    if CATEGORY_LOG_TRANSPORT == 'webhook' then
+        return true
+    end
+
+    if CATEGORY_LOG_TRANSPORT == 'bot' then
+        return false
+    end
+
+    -- auto mode: fallback to webhook first when bot transport is not available.
+    return not canUseBotCategoryTransport(category)
 end
 
 local function getCategoryThreadKey(category, payload)
@@ -102,7 +205,7 @@ local function createForumThread(forumChannelId, threadName, starterContent, cal
                 end
             end
 
-            print('^1[DG-Discord] Thread creation failed for forum ' .. tostring(forumChannelId) .. ' (HTTP ' .. tostring(statusCode) .. ')^0')
+            logDiscordHttpFailure('Thread creation (forum ' .. tostring(forumChannelId) .. ')', statusCode, response)
             if callback then callback(nil) end
         end,
         'POST', body,
@@ -172,22 +275,69 @@ local function fallbackToWebhook(category, payload)
     if not LEGACY_WEBHOOK_FALLBACK then return end
 
     payload = type(payload) == 'table' and payload or {}
+    local threadName = buildWebhookThreadName(category, payload)
 
     if payload.title and payload.description then
-        sendDiscordMessage(payload.title, payload.description, payload.color or 3447003, payload.fields or {})
+        local fields = payload.fields or {}
+        table.insert(fields, { name = 'Timestamp', value = os.date('%Y-%m-%d %H:%M:%S'), inline = true })
+
+        local webhookPayload = {
+            embeds = {
+                {
+                    title = payload.title,
+                    description = payload.description,
+                    color = payload.color or 3447003,
+                    fields = fields,
+                    footer = { text = 'dg-adminpanel' }
+                }
+            }
+        }
+
+        if threadName then
+            webhookPayload.thread_name = threadName
+        end
+
+        if not sendWebhookPayload(webhookPayload, 'Webhook fallback (title)') then
+            sendDiscordMessage(payload.title, payload.description, payload.color or 3447003, payload.fields or {})
+        end
         return
     end
 
     if payload.embeds and payload.embeds[1] then
-        local first = payload.embeds[1]
-        sendDiscordMessage(
-            first.title or ('Forum Log - ' .. tostring(category or 'general')),
-            first.description or 'Fallback webhook log.',
-            first.color or 3447003,
-            first.fields or {}
-        )
+        local webhookPayload = { embeds = payload.embeds }
+
+        if threadName then
+            webhookPayload.thread_name = threadName
+        end
+
+        if not sendWebhookPayload(webhookPayload, 'Webhook fallback (embeds)') then
+            local first = payload.embeds[1]
+            sendDiscordMessage(
+                first.title or ('Forum Log - ' .. tostring(category or 'general')),
+                first.description or 'Fallback webhook log.',
+                first.color or 3447003,
+                first.fields or {}
+            )
+        end
     elseif payload.message then
-        logToDiscord('Forum Log - ' .. tostring(category or 'general'), tostring(payload.message), payload.color or 3447003)
+        local webhookPayload = {
+            embeds = {
+                {
+                    title = 'Forum Log - ' .. tostring(category or 'general'),
+                    description = tostring(payload.message),
+                    color = payload.color or 3447003,
+                    footer = { text = os.date('%Y-%m-%d %H:%M:%S') }
+                }
+            }
+        }
+
+        if threadName then
+            webhookPayload.thread_name = threadName
+        end
+
+        if not sendWebhookPayload(webhookPayload, 'Webhook fallback (message)') then
+            logToDiscord('Forum Log - ' .. tostring(category or 'general'), tostring(payload.message), payload.color or 3447003)
+        end
     end
 end
 
@@ -201,7 +351,7 @@ function logToDiscord(title, message, color)
     local webhook = DISCORD_WEBHOOK
     if webhook == '' or webhook == 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE' then return end
     
-    PerformHttpRequest(webhook, function() end, 'POST', json.encode({
+    local payload = {
         username = 'DG AdminPanel',
         embeds = {{
             title = title,
@@ -209,7 +359,17 @@ function logToDiscord(title, message, color)
             color = color or 16711680,
             footer = { text = os.date('%Y-%m-%d %H:%M:%S') }
         }}
-    }), { ['Content-Type'] = 'application/json' })
+    }
+
+    if WEBHOOK_THREAD_NAME ~= '' then
+        payload.thread_name = WEBHOOK_THREAD_NAME
+    end
+
+    PerformHttpRequest(webhook, function(statusCode, response)
+        if statusCode ~= 200 and statusCode ~= 201 and statusCode ~= 204 then
+            logDiscordHttpFailure('Webhook log', statusCode, response)
+        end
+    end, 'POST', json.encode(payload), { ['Content-Type'] = 'application/json' })
 end
 
 -- Export: Send Discord message with custom fields
@@ -230,9 +390,16 @@ function sendDiscordMessage(title, description, color, extraFields)
         }
     }
     
-    PerformHttpRequest(DISCORD_WEBHOOK, function(statusCode, response, headers)
-        -- Silently handle response
-    end, 'POST', json.encode({ embeds = embed }), { ['Content-Type'] = 'application/json' })
+    local payload = { embeds = embed }
+    if WEBHOOK_THREAD_NAME ~= '' then
+        payload.thread_name = WEBHOOK_THREAD_NAME
+    end
+
+    PerformHttpRequest(DISCORD_WEBHOOK, function(statusCode, response)
+        if statusCode ~= 200 and statusCode ~= 201 and statusCode ~= 204 then
+            logDiscordHttpFailure('Webhook embed', statusCode, response)
+        end
+    end, 'POST', json.encode(payload), { ['Content-Type'] = 'application/json' })
 end
 
 CreateThread(function()
@@ -383,7 +550,7 @@ function postToCategoryForum(category, payload)
     if not embeds then
         embeds = {
             {
-                title = payload.title or ('Log - ' .. tostring(category or 'general')),
+                title = payload.title or getDefaultCategoryPostTitle(category),
                 description = payload.description or payload.message or 'No message provided.',
                 color = payload.color or 3447003,
                 fields = payload.fields or {},
@@ -391,6 +558,14 @@ function postToCategoryForum(category, payload)
                 timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ')
             }
         }
+    end
+
+    -- Keep one canonical payload shape for all transport paths.
+    payload.embeds = payload.embeds or embeds
+
+    if shouldUseWebhookTransportFirst(category) then
+        fallbackToWebhook(category, payload)
+        return
     end
 
     getOrCreateCategoryThread(category, payload, function(threadId, cacheKey)
@@ -402,7 +577,7 @@ function postToCategoryForum(category, payload)
         local requestBody = json.encode({ embeds = embeds })
         local postUrl = 'https://discord.com/api/v10/channels/' .. tostring(threadId) .. '/messages'
 
-        PerformHttpRequest(postUrl, function(statusCode)
+        PerformHttpRequest(postUrl, function(statusCode, response)
             if statusCode == 404 then
                 if cacheKey then categoryThreads[cacheKey] = nil end
 
@@ -419,7 +594,7 @@ function postToCategoryForum(category, payload)
             end
 
             if statusCode ~= 200 and statusCode ~= 201 then
-                print('^1[DG-Discord] Category post failed for ' .. tostring(category) .. ' (HTTP ' .. tostring(statusCode) .. ')^0')
+                logDiscordHttpFailure('Category post (' .. tostring(category) .. ')', statusCode, response)
                 fallbackToWebhook(category, payload)
             end
         end,
