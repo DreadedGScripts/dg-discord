@@ -4,11 +4,191 @@
 local DISCORD_WEBHOOK = Config.discordWebhookUrl or ""
 local DISCORD_BOT_TOKEN = Config.discordBotToken or ""
 local DISCORD_FORUM_CHANNEL_ID = Config.discordForumChannelId or ""
+local ENABLE_CATEGORY_FORUMS = Config.enableCategoryForums ~= false
+local LEGACY_WEBHOOK_FALLBACK = Config.legacyWebhookFallback ~= false
+local FORUM_CATEGORIES = Config.forumCategories or {}
 
 local playerThreads = {} -- In-memory cache: license -> Discord thread ID
+local categoryThreads = {} -- In-memory cache: "category:threadKey" -> Discord thread ID
 
 local function isPlaceholder(value, placeholder)
     return type(value) ~= 'string' or value == '' or value == placeholder
+end
+
+local function normalizeCategory(category)
+    return tostring(category or ''):lower():gsub('[^%w_]', '_')
+end
+
+local function getCategoryForumChannelId(category)
+    local normalized = normalizeCategory(category)
+    local configured = FORUM_CATEGORIES[normalized]
+    if configured and configured ~= '' and not tostring(configured):find('PASTE_') then
+        return tostring(configured)
+    end
+
+    -- Keep compatibility with the old single-forum setup.
+    if normalized == 'scores_detections' then
+        return DISCORD_FORUM_CHANNEL_ID
+    end
+
+    return nil
+end
+
+local function safeSub(str, maxLen)
+    local value = tostring(str or '')
+    if #value <= maxLen then return value end
+    return value:sub(1, math.max(1, maxLen - 1))
+end
+
+local function getCategoryThreadKey(category, payload)
+    local normalized = normalizeCategory(category)
+    payload = type(payload) == 'table' and payload or {}
+
+    if normalized == 'join_leave' then
+        return os.date('%Y-%m-%d')
+    elseif normalized == 'scores_detections' then
+        return tostring(payload.playerLicense or payload.license or payload.playerName or 'unknown')
+    elseif normalized == 'reports' then
+        return tostring(payload.reportId or ('reporter_' .. tostring(payload.reporterId or 'unknown')))
+    elseif normalized == 'moderation' then
+        return tostring(payload.targetLicense or payload.targetId or payload.targetName or 'unknown')
+    elseif normalized == 'admin_audit' then
+        return tostring(payload.adminLicense or payload.adminId or payload.adminName or 'unknown') .. ':' .. os.date('%Y-%m-%d')
+    end
+
+    return tostring(payload.threadKey or payload.playerLicense or payload.license or os.date('%Y-%m-%d'))
+end
+
+local function buildCategoryThreadName(category, payload)
+    local normalized = normalizeCategory(category)
+    payload = type(payload) == 'table' and payload or {}
+
+    if normalized == 'join_leave' then
+        return safeSub('🟢 Join/Leave - ' .. os.date('%Y-%m-%d'), 100)
+    elseif normalized == 'scores_detections' then
+        local playerName = payload.playerName or 'Unknown Player'
+        return safeSub('📈 Scores - ' .. tostring(playerName), 100)
+    elseif normalized == 'reports' then
+        local reportId = payload.reportId and ('#' .. tostring(payload.reportId)) or '#new'
+        return safeSub('📣 Reports ' .. reportId, 100)
+    elseif normalized == 'moderation' then
+        local targetName = payload.targetName or 'Unknown Player'
+        return safeSub('🔨 Moderation - ' .. tostring(targetName), 100)
+    elseif normalized == 'admin_audit' then
+        local adminName = payload.adminName or 'Unknown Admin'
+        return safeSub('🛡️ Audit - ' .. tostring(adminName) .. ' - ' .. os.date('%Y-%m-%d'), 100)
+    end
+
+    return safeSub('📌 ' .. tostring(category or 'general') .. ' - ' .. os.date('%Y-%m-%d'), 100)
+end
+
+local function createForumThread(forumChannelId, threadName, starterContent, callback)
+    local body = json.encode({
+        name = safeSub(threadName, 100),
+        message = {
+            content = tostring(starterContent or 'DG forum log thread initialized.')
+        },
+        auto_archive_duration = 10080
+    })
+
+    PerformHttpRequest(
+        'https://discord.com/api/v10/channels/' .. tostring(forumChannelId) .. '/threads',
+        function(statusCode, response)
+            if statusCode == 200 or statusCode == 201 then
+                local data = json.decode(response or '{}')
+                if data and data.id then
+                    if callback then callback(data.id) end
+                    return
+                end
+            end
+
+            print('^1[DG-Discord] Thread creation failed for forum ' .. tostring(forumChannelId) .. ' (HTTP ' .. tostring(statusCode) .. ')^0')
+            if callback then callback(nil) end
+        end,
+        'POST', body,
+        {
+            ['Content-Type'] = 'application/json',
+            ['Authorization'] = 'Bot ' .. DISCORD_BOT_TOKEN,
+        }
+    )
+end
+
+local function getOrCreateCategoryThread(category, payload, callback)
+    if not Config.enableBotAPI or not ENABLE_CATEGORY_FORUMS then
+        if callback then callback(nil) end
+        return
+    end
+
+    if isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE') then
+        if callback then callback(nil) end
+        return
+    end
+
+    local normalized = normalizeCategory(category)
+    local forumChannelId = getCategoryForumChannelId(normalized)
+    if not forumChannelId then
+        if callback then callback(nil) end
+        return
+    end
+
+    local threadKey = getCategoryThreadKey(normalized, payload)
+    local cacheKey = normalized .. ':' .. threadKey
+    if categoryThreads[cacheKey] then
+        if callback then callback(categoryThreads[cacheKey], cacheKey) end
+        return
+    end
+
+    MySQL.Async.fetchScalar(
+        'SELECT thread_id FROM dg_discord_category_threads WHERE category_key = ? AND thread_key = ?',
+        { normalized, threadKey },
+        function(existingId)
+            if existingId then
+                categoryThreads[cacheKey] = tostring(existingId)
+                if callback then callback(categoryThreads[cacheKey], cacheKey) end
+                return
+            end
+
+            createForumThread(
+                forumChannelId,
+                buildCategoryThreadName(normalized, payload),
+                '🧵 Category log thread for **' .. normalized .. '**.',
+                function(createdThreadId)
+                    if createdThreadId then
+                        categoryThreads[cacheKey] = tostring(createdThreadId)
+                        MySQL.Async.execute(
+                            'INSERT IGNORE INTO dg_discord_category_threads (category_key, thread_key, thread_id, thread_name) VALUES (?, ?, ?, ?)',
+                            { normalized, threadKey, createdThreadId, buildCategoryThreadName(normalized, payload) }
+                        )
+                    end
+
+                    if callback then callback(createdThreadId, cacheKey) end
+                end
+            )
+        end
+    )
+end
+
+local function fallbackToWebhook(category, payload)
+    if not LEGACY_WEBHOOK_FALLBACK then return end
+
+    payload = type(payload) == 'table' and payload or {}
+
+    if payload.title and payload.description then
+        sendDiscordMessage(payload.title, payload.description, payload.color or 3447003, payload.fields or {})
+        return
+    end
+
+    if payload.embeds and payload.embeds[1] then
+        local first = payload.embeds[1]
+        sendDiscordMessage(
+            first.title or ('Forum Log - ' .. tostring(category or 'general')),
+            first.description or 'Fallback webhook log.',
+            first.color or 3447003,
+            first.fields or {}
+        )
+    elseif payload.message then
+        logToDiscord('Forum Log - ' .. tostring(category or 'general'), tostring(payload.message), payload.color or 3447003)
+    end
 end
 
 -- ==========================================
@@ -196,6 +376,61 @@ function postToPlayerThread(license, playerName, embeds)
     end)
 end
 
+-- Export: Post a category log into category-specific forum threads with webhook fallback.
+function postToCategoryForum(category, payload)
+    payload = type(payload) == 'table' and payload or {}
+    local embeds = payload.embeds
+    if not embeds then
+        embeds = {
+            {
+                title = payload.title or ('Log - ' .. tostring(category or 'general')),
+                description = payload.description or payload.message or 'No message provided.',
+                color = payload.color or 3447003,
+                fields = payload.fields or {},
+                footer = { text = payload.footerText or 'DG Logging' },
+                timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ')
+            }
+        }
+    end
+
+    getOrCreateCategoryThread(category, payload, function(threadId, cacheKey)
+        if not threadId then
+            fallbackToWebhook(category, payload)
+            return
+        end
+
+        local requestBody = json.encode({ embeds = embeds })
+        local postUrl = 'https://discord.com/api/v10/channels/' .. tostring(threadId) .. '/messages'
+
+        PerformHttpRequest(postUrl, function(statusCode)
+            if statusCode == 404 then
+                if cacheKey then categoryThreads[cacheKey] = nil end
+
+                local normalized = normalizeCategory(category)
+                local threadKey = getCategoryThreadKey(normalized, payload)
+                MySQL.Async.execute(
+                    'DELETE FROM dg_discord_category_threads WHERE category_key = ? AND thread_key = ?',
+                    { normalized, threadKey },
+                    function()
+                        postToCategoryForum(category, payload)
+                    end
+                )
+                return
+            end
+
+            if statusCode ~= 200 and statusCode ~= 201 then
+                print('^1[DG-Discord] Category post failed for ' .. tostring(category) .. ' (HTTP ' .. tostring(statusCode) .. ')^0')
+                fallbackToWebhook(category, payload)
+            end
+        end,
+        'POST', requestBody,
+        {
+            ['Content-Type'] = 'application/json',
+            ['Authorization'] = 'Bot ' .. DISCORD_BOT_TOKEN,
+        })
+    end)
+end
+
 -- ==========================================
 -- EMBED BUILDERS
 -- ==========================================
@@ -301,6 +536,16 @@ CreateThread(function()
             thread_id VARCHAR(32) NOT NULL,
             player_name VARCHAR(128),
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )]], {}, function() end)
+
+        MySQL.Async.execute([[CREATE TABLE IF NOT EXISTS dg_discord_category_threads (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            category_key VARCHAR(64) NOT NULL,
+            thread_key VARCHAR(191) NOT NULL,
+            thread_id VARCHAR(32) NOT NULL,
+            thread_name VARCHAR(128),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_category_thread (category_key, thread_key)
         )]], {}, function() end)
     end)
 end)

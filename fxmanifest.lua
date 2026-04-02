@@ -18,6 +18,7 @@ server_scripts {
 server_exports {
     'logToDiscord',
     'sendDiscordMessage',
+    'postToCategoryForum',
     'postToPlayerThread',
     'getOrCreatePlayerThread',
     'buildDetectionEmbed',
