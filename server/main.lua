@@ -11,6 +11,7 @@ local ENABLE_CATEGORY_FORUMS = Config.enableCategoryForums ~= false
 local LEGACY_WEBHOOK_FALLBACK = Config.legacyWebhookFallback ~= false
 local FORUM_CATEGORIES = Config.forumCategories or {}
 local CATEGORY_LOG_TRANSPORT = tostring(Config.categoryLogTransport or 'webhook'):lower()
+local THREAD_CLEANUP_ON_STARTUP = type(Config.threadCleanupOnStartup) == 'table' and Config.threadCleanupOnStartup or {}
 
 local playerThreads = {} -- In-memory cache: license -> Discord thread ID
 local categoryThreads = {} -- In-memory cache: "category:threadKey" -> Discord thread ID
@@ -25,6 +26,143 @@ end
 
 local function isPlaceholder(value, placeholder)
     return type(value) ~= 'string' or value == '' or value == placeholder
+end
+
+local function deleteDiscordThread(threadId, callback)
+    local id = tostring(threadId or '')
+    if id == '' then
+        if callback then callback(true) end
+        return
+    end
+
+    PerformHttpRequest(
+        'https://discord.com/api/v10/channels/' .. id,
+        function(statusCode, response)
+            if statusCode == 200 or statusCode == 202 or statusCode == 204 or statusCode == 404 then
+                if callback then callback(true) end
+                return
+            end
+
+            logDiscordHttpFailure('Thread delete (' .. id .. ')', statusCode, response)
+            if callback then callback(false) end
+        end,
+        'DELETE',
+        '',
+        {
+            ['Authorization'] = 'Bot ' .. DISCORD_BOT_TOKEN,
+        }
+    )
+end
+
+local function runStartupThreadCleanup(callback)
+    if THREAD_CLEANUP_ON_STARTUP.enabled ~= true then
+        if callback then callback() end
+        return
+    end
+
+    if isPlaceholder(DISCORD_BOT_TOKEN, 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE') then
+        print('^3[DG-Discord] Startup thread cleanup skipped: bot token is not configured.^0')
+        if callback then callback() end
+        return
+    end
+
+    local collectedIds = {}
+    local seen = {}
+
+    local function addThreadId(threadId)
+        local id = tostring(threadId or '')
+        if id == '' or seen[id] then return end
+        seen[id] = true
+        table.insert(collectedIds, id)
+    end
+
+    local function clearMappingsAndFinish()
+        playerThreads = {}
+        categoryThreads = {}
+
+        local deleteStatements = {}
+        if THREAD_CLEANUP_ON_STARTUP.deletePlayerThreads ~= false then
+            table.insert(deleteStatements, 'DELETE FROM dg_discord_threads')
+        end
+        if THREAD_CLEANUP_ON_STARTUP.deleteCategoryThreads ~= false then
+            table.insert(deleteStatements, 'DELETE FROM dg_discord_category_threads')
+        end
+
+        local idx = 1
+        local function runDelete()
+            local stmt = deleteStatements[idx]
+            if not stmt then
+                if callback then callback() end
+                return
+            end
+
+            MySQL.Async.execute(stmt, {}, function()
+                idx = idx + 1
+                runDelete()
+            end)
+        end
+
+        runDelete()
+    end
+
+    local function deleteCollected(index)
+        if index > #collectedIds then
+            print(('^2[DG-Discord] Startup thread cleanup complete. Removed %d Discord thread reference(s).^0'):format(#collectedIds))
+            clearMappingsAndFinish()
+            return
+        end
+
+        deleteDiscordThread(collectedIds[index], function()
+            deleteCollected(index + 1)
+        end)
+    end
+
+    local function collectCategoryThreads()
+        if THREAD_CLEANUP_ON_STARTUP.deleteCategoryThreads == false then
+            deleteCollected(1)
+            return
+        end
+
+        MySQL.Async.fetchAll('SELECT thread_id FROM dg_discord_category_threads', {}, function(rows)
+            for _, row in ipairs(rows or {}) do
+                addThreadId(row.thread_id)
+            end
+            deleteCollected(1)
+        end)
+    end
+
+    if THREAD_CLEANUP_ON_STARTUP.deletePlayerThreads == false then
+        collectCategoryThreads()
+        return
+    end
+
+    MySQL.Async.fetchAll('SELECT thread_id FROM dg_discord_threads', {}, function(rows)
+        for _, row in ipairs(rows or {}) do
+            addThreadId(row.thread_id)
+        end
+        collectCategoryThreads()
+    end)
+end
+
+local function coerceString(value, fallback)
+    if type(value) == 'table' then
+        return tostring(value.playerName or value.targetName or value.name or value.license or value.playerLicense or fallback or '')
+    end
+    if value == nil then
+        return tostring(fallback or '')
+    end
+    return tostring(value)
+end
+
+local function coerceNumber(value, fallback)
+    if type(value) == 'table' then
+        return tonumber(value.score or value.points or value.value or fallback) or tonumber(fallback) or 0
+    end
+    return tonumber(value) or tonumber(fallback) or 0
+end
+
+local function coerceTable(value)
+    return type(value) == 'table' and value or {}
 end
 
 local function normalizeCategory(category)
@@ -575,9 +713,11 @@ CreateThread(function()
         print('^3[DG-Discord] WARNING: ' .. warning .. '^0')
     end
 
-    if (Config.enableWebhook and not isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE')) or canUseBotLogging() then
-        logToDiscord('DG Discord Bot Online', 'Monitoring users', 5763719)
-    end
+    runStartupThreadCleanup(function()
+        if (Config.enableWebhook and not isPlaceholder(DISCORD_WEBHOOK, 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE')) or canUseBotLogging() then
+            logToDiscord('DG Discord Bot Online', 'Monitoring users', 5763719)
+        end
+    end)
 end)
 
 -- ==========================================
@@ -586,6 +726,9 @@ end)
 
 -- Export: Get or create a player's dedicated forum thread
 function getOrCreatePlayerThread(license, playerName, callback)
+    license = coerceString(license, 'unknown')
+    playerName = coerceString(playerName, 'Unknown Player')
+
     if not Config.enableBotAPI or not Config.enablePlayerThreads then
         if callback then callback(nil) end
         return
@@ -661,6 +804,10 @@ end
 
 -- Export: Post message to player's forum thread
 function postToPlayerThread(license, playerName, embeds)
+    license = coerceString(license, 'unknown')
+    playerName = coerceString(playerName, 'Unknown Player')
+    embeds = coerceTable(embeds)
+
     if not Config.enableBotAPI or not Config.enablePlayerThreads then return end
     
     getOrCreatePlayerThread(license, playerName, function(threadId)
@@ -800,6 +947,14 @@ end
 
 -- Export: Build detection embed
 function buildDetectionEmbed(playerName, reason, weight, score, scoreIncrease, details, identifiers)
+    playerName = coerceString(playerName, 'Unknown Player')
+    reason = coerceString(reason, 'unknown')
+    weight = coerceString(weight, 'low')
+    score = coerceNumber(score, 0)
+    scoreIncrease = coerceNumber(scoreIncrease, 0)
+    details = coerceTable(details)
+    identifiers = coerceTable(identifiers)
+
     local detailsStr = ""
     if type(details) == 'table' then
         for k, v in pairs(details) do
@@ -815,7 +970,7 @@ function buildDetectionEmbed(playerName, reason, weight, score, scoreIncrease, d
     local fields = {
         { name = '⚠️ Detection', value = getDetectionName(reason), inline = true },
         { name = '📊 Severity', value = getWeightEmoji(weight), inline = true },
-        { name = '🎯 Score', value = '**' .. score .. '**/8 *(+' .. scoreIncrease .. ')*', inline = true },
+        { name = '🎯 Score', value = '**' .. tostring(score) .. '**/8 *(+' .. tostring(scoreIncrease) .. ')*', inline = true },
     }
     
     if detailsStr ~= "" then
@@ -833,22 +988,36 @@ end
 
 -- Export: Build player info embed
 function buildPlayerInfoEmbed(playerName, license, identifiers, serverId, ping)
+    playerName = coerceString(playerName, 'Unknown Player')
+    license = coerceString(license, 'N/A')
+    identifiers = coerceTable(identifiers)
+    serverId = coerceNumber(serverId, 'N/A')
+
+    local pingValue = ping
+    if type(pingValue) == 'table' then
+        pingValue = pingValue.ping or pingValue.value or pingValue.latency
+    end
+    pingValue = tostring(pingValue or 'N/A')
+
+    local steamId = coerceString(identifiers.steamid, 'N/A')
+    local discordIdValue = coerceString(identifiers.discord, 'N/A')
+
     local fields = {
         { name = '🎮 Player Name', value = '**' .. playerName .. '**', inline = true },
         { name = '🔢 Server ID', value = '`' .. tostring(serverId or 'N/A') .. '`', inline = true },
-        { name = '📶 Ping', value = tostring(ping or 'N/A') .. ' ms', inline = true },
+        { name = '📶 Ping', value = pingValue .. ' ms', inline = true },
     }
     
     table.insert(fields, { name = '🔑 FiveM License', value = '```' .. license .. '```', inline = false })
     
-    if identifiers.steamid and identifiers.steamid ~= 'N/A' then
-        table.insert(fields, { name = '🎯 Steam ID', value = '`' .. identifiers.steamid .. '`', inline = true })
+    if steamId ~= '' and steamId ~= 'N/A' then
+        table.insert(fields, { name = '🎯 Steam ID', value = '`' .. steamId .. '`', inline = true })
     else
         table.insert(fields, { name = '🎯 Steam ID', value = 'Not Linked', inline = true })
     end
     
-    if identifiers.discord and identifiers.discord ~= 'N/A' then
-        local discordId = identifiers.discord:gsub('discord:', '')
+    if discordIdValue ~= '' and discordIdValue ~= 'N/A' then
+        local discordId = discordIdValue:gsub('discord:', '')
         table.insert(fields, { name = '💬 Discord', value = '<@' .. discordId .. '>', inline = true })
     else
         table.insert(fields, { name = '💬 Discord', value = 'Not Linked', inline = true })
