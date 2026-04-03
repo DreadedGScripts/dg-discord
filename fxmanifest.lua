@@ -12,6 +12,7 @@ dependency 'oxmysql'
 server_scripts {
     '@oxmysql/lib/MySQL.lua',
     'config.lua',
+    'server/version_check.lua',
     'server/*.lua'
 }
 
